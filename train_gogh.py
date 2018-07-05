@@ -21,7 +21,7 @@ import chainer.links as L
 from chainer import cuda, Variable, optimizers, serializers
 
 
-## trancated VGG
+## truncated VGG
 class VGG(chainer.Chain):
     def __init__(self):
         super(VGG, self).__init__(
@@ -92,7 +92,7 @@ def generate_image(image, style, args, img_gen=None):
         feature_s = nn(Variable(style))
     gram_s = [gram_matrix(y) for y in feature_s]
 
-    ## randamise initial image
+    ## randomise initial image
     if img_gen is None:
         if args.gpu >= 0:
             img_gen = xp.random.uniform(-20,20,image.shape,dtype=np.float32)
@@ -104,7 +104,7 @@ def generate_image(image, style, args, img_gen=None):
     optimizer = optimizers.Adam(alpha=args.lr)
     optimizer.setup(img_gen)
     print("losses: feature, style, variance, total")
-    for i in range(args.iter):
+    for i in range(1,args.iter+1):
         img_gen.zerograds()
 
         with chainer.using_config('train', False):
@@ -130,12 +130,14 @@ def generate_image(image, style, args, img_gen=None):
             print('iter {}/{}... loss: {}, {}, {}, {}'.format(i, args.iter, L_feat.data, L_style.data, L_tv.data, loss.data))
 
         ## output image
-        if (i % args.interval == 0) and i>0:
+        if (i % args.interval == 0):
             med = postprocess(img_gen.W)
             print("image range {} -- {}".format(np.min(med),np.max(med)))
             med = Image.fromarray(med)
-            if args.median_filter > 0:
+            if args.median_filter > 0: ## median filter
                 med = med.filter(ImageFilter.MedianFilter(args.median_filter))
+            if args.removebg:  ## paste back background
+               med = Image.alpha_composite(med.convert("RGBA"),bkgnd).convert("RGB")
             med.save(os.path.join(args.out,'count{:0>4}.jpg'.format(i)))
 
 
@@ -192,6 +194,10 @@ if args.gpu>=0:
 ## load images
 image = load_image(args.input,removebg=args.removebg)
 style = load_image(args.style,size=(image.shape[3],image.shape[2]), removebg=args.removebg)
+if args.removebg: # background image
+    bg = np.array(Image.open(args.input).convert('RGBA'))
+    bg[:,:,3] = 255-bg[:,:,3]
+    bkgnd = Image.fromarray(bg)
 
 print("input image:", image.shape, xp.min(image), xp.max(image))
 print("style image:", style.shape, xp.min(style), xp.max(style))

@@ -7,6 +7,10 @@ The code is largely based on
 
 The script generates a stylised image from an input image and a style image.
 
+## Demo on Google Colaboratory
+You can try the demo on a browser
+[Google Colaboratory](https://colab.research.google.com/drive/1ioGT6LE4KKU4Ttx_e0-j1REOAiu32iLo)
+
 ## Requirements
 - Python 3: [Anaconda](https://www.anaconda.com/download/) is recommended
 - Python libraries: chainer >= 5.3.0, cupy:  `pip install cupy chainer`

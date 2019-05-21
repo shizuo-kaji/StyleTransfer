@@ -18,49 +18,21 @@ from PIL import Image, ImageFilter
 import chainer
 import chainer.functions as F
 import chainer.links as L
-from chainer import cuda, Variable, optimizers, serializers
-
-
-## truncated VGG
-class VGG(chainer.Chain):
-    def __init__(self):
-        super(VGG, self).__init__(
-            conv1_1=L.Convolution2D(3, 64, 3, stride=1, pad=1),
-            conv1_2=L.Convolution2D(64, 64, 3, stride=1, pad=1),
-            conv2_1=L.Convolution2D(64, 128, 3, stride=1, pad=1),
-            conv2_2=L.Convolution2D(128, 128, 3, stride=1, pad=1),
-            conv3_1=L.Convolution2D(128, 256, 3, stride=1, pad=1),
-            conv3_2=L.Convolution2D(256, 256, 3, stride=1, pad=1),
-            conv3_3=L.Convolution2D(256, 256, 3, stride=1, pad=1),
-            conv4_1=L.Convolution2D(256, 512, 3, stride=1, pad=1),
-            conv4_2=L.Convolution2D(512, 512, 3, stride=1, pad=1),
-            conv4_3=L.Convolution2D(512, 512, 3, stride=1, pad=1),
-            conv5_1=L.Convolution2D(512, 512, 3, stride=1, pad=1),
-            conv5_2=L.Convolution2D(512, 512, 3, stride=1, pad=1),
-            conv5_3=L.Convolution2D(512, 512, 3, stride=1, pad=1)
-        )
-
-    def __call__(self, x):
-        y1 = F.relu(self.conv1_2(F.relu(self.conv1_1(x))))
-        h = F.max_pooling_2d(y1, 2, stride=2)
-        y2 = F.relu(self.conv2_2(F.relu(self.conv2_1(h))))
-        h = F.max_pooling_2d(y2, 2, stride=2)
-        y3 = F.relu(self.conv3_3(F.relu(self.conv3_2(F.relu(self.conv3_1(h))))))
-        h = F.max_pooling_2d(y3, 2, stride=2)
-        y4 = F.relu(self.conv4_3(F.relu(self.conv4_2(F.relu(self.conv4_1(h))))))
-        return [y1, y2, y3, y4]
+from chainer import cuda, Variable, optimizers, serializers, training
+from chainer.training import extensions
 
 ## returns an image in range [0,255]
-def postprocess(var):
-    if args.gpu >= 0:
-        img = var.data.get() + 120
+def postprocess(var, gpu):
+    if gpu >= 0:
+        img = var.array.get() + 120
     else:
-        img = var.data+120
+        img = var.array+120
     img = np.clip(img,0,255)
     img = img.transpose(0, 2, 3, 1)   
     if img.shape[3]==1:
-        img=img[:,:,:,0]   
-    return np.uint8(img[0,:,:,::-1])    # BGR => RGB
+        return np.uint8(img[0,:,:,0])
+    else:
+        return np.uint8(img[0,:,:,::-1])    # BGR => RGB
 
 ## gram matrix (style matrix)
 def gram_matrix(y):
@@ -68,6 +40,20 @@ def gram_matrix(y):
     features = F.reshape(y, (b, ch, w*h))
     gram = F.batch_matmul(features, features, transb=True)/np.float32(ch*w*h)
     return gram
+
+## return [0,255]-120 image of shape (1,h,h)
+def load_dicom(path,base,rng,h,scale):
+    import pydicom as dicom
+    from chainercv.transforms import center_crop
+    from skimage.transform import rescale
+    ref_dicom = dicom.read_file(path, force=True)
+    ref_dicom.file_meta.TransferSyntaxUID = dicom.uid.ImplicitVRLittleEndian
+    img = ref_dicom.pixel_array.astype(np.float32)+ref_dicom.RescaleIntercept
+    if scale != 1.0:
+        img = rescale(img,scale,mode="reflect",preserve_range=True).astype(np.float32)
+    img = (np.clip(img,base,base+rng)-base)/rng * 255 -120
+    img = center_crop(img[np.newaxis,:],(h,h))
+    return(img)
 
 ## return [0,255]-120 image of shape (3,h,h)
 def load_image(path, size=None, removebg=False):
@@ -79,131 +65,218 @@ def load_image(path, size=None, removebg=False):
         img = img.resize(size,Image.LANCZOS)
 #    Image.fromarray(np.uint8(img).transpose((1,2,0))).save("b.jpg")
     img = np.asarray(img)[:,:,:3].transpose(2, 0, 1)[::-1].astype(np.float32) -120  # BGR
-    return(xp.asarray(img[np.newaxis,:]))
+    return(img[np.newaxis,:])
 
-## the main image generation routine
-def generate_image(image, style, args, img_gen=None):
-    ## convolution kernel for total variation
-    wh = xp.asarray([[[[1], [-1]], [[0], [0]], [[0], [0]]], [[[0], [0]], [[1], [-1]], [[0], [0]]], [[[0], [0]], [[0], [0]], [[1], [-1]]]], dtype=np.float32)
-    ww = xp.asarray([[[[1, -1]], [[0, 0]], [[0, 0]]], [[[0, 0]], [[1, -1]], [[0, 0]]], [[[0, 0]], [[0, 0]], [[1, -1]]]], dtype=np.float32)
-    ## compute style matrix
-    with chainer.using_config('train', False):
-        feature = nn(Variable(image))
-        feature_s = nn(Variable(style))
-    gram_s = [gram_matrix(y) for y in feature_s]
+class Updater(chainer.training.StandardUpdater):
+    def __init__(self, *args, **kwargs):
+        self.img_gen, self.perceptual = kwargs.pop('models')
+        params = kwargs.pop('params')
+        self.args = params['args']
+        self.image = params['image']  ## contents image
+        self.bkgnd = params['bkgnd']  ## background image
+        self.reduced_feature = params['reduced_feature']  ## reduced size contents image
+        self.layers = params['layers']  ## layers used to compute image and style losses
+        self.gram_s = params['gram_s']   ## gram matrix of style image
+        self.feature = params['feature']   ## feature of contents image
+        self.layer_id = 3 ## which layer output to use for contents comparison; default = 3
+        super(Updater, self).__init__(*args, **kwargs)
 
-    ## randomise initial image
-    if img_gen is None:
-        if args.gpu >= 0:
-            img_gen = xp.random.uniform(-20,20,image.shape,dtype=np.float32)
-        else:
-            img_gen = np.random.uniform(-20,20,image.shape).astype(np.float32)
-
-    ## image optimisation
-    img_gen = L.Parameter(img_gen)
-    optimizer = optimizers.Adam(alpha=args.lr)
-    optimizer.setup(img_gen)
-    print("losses: feature, style, variance, total")
-    for i in range(1,args.iter+1):
-        img_gen.zerograds()
+    def update_core(self):
+        optimizer = self.get_optimizer('main')
+        self.img_gen.cleargrads()
+        # get mini-batch
+#        batch = self.get_iterator('main').next()
+#        img = self.converter(batch, self.device)
+#        x = Variable(img)
 
         with chainer.using_config('train', False):
-            y = nn(img_gen.W)
+            y = self.perceptual(self.img_gen.W,layers=self.layers)
 
-        # feature consistency evaluated on the output of layer conv3_3
-        L_feat = args.lambda_feat * F.mean_squared_error(feature[2], y[2])
-        # style resemblance evaluated on the output of four layers
-        L_style = Variable(xp.zeros((), dtype=np.float32))
-        for f_hat, g_s in zip(y, gram_s):
-            L_style += args.lambda_style * F.mean_squared_error(gram_matrix(f_hat), g_s)
-        # surpress total variation
-        L_tv = args.lambda_tv * (F.sum(F.convolution_2d(img_gen.W, W=wh) ** 2) + F.sum(F.convolution_2d(img_gen.W, W=ww) ** 2))
-        loss = L_feat + L_style + L_tv
+        # feature consistency; experiment with different layers to use
+        L_feat = F.mean_squared_error(self.feature[self.layers[self.layer_id]], y[self.layers[self.layer_id]])
+
+        # feature consistency for reduced image
+        if self.args.lambda_rfeat > 0:
+            with chainer.using_config('train', False):
+                yr = self.perceptual(F.average_pooling_2d(self.img_gen.W,self.args.ksize),layers=self.layers)
+            L_feat_r = F.mean_squared_error(self.reduced_feature[self.layers[self.layer_id]], yr[self.layers[self.layer_id]])
+        else:
+            L_feat_r = 0
+        
+        # style resemblance evaluated on the output of all layers
+        if self.args.lambda_style > 0:
+            L_style = sum([F.mean_squared_error(gram_matrix(y[k]), self.gram_s[k]) for k in self.layers])
+        else:
+            L_style = 0
+
+        # suppress total variation
+        L_tv = F.average(F.absolute(self.img_gen.W[:,:,1:,:]-self.img_gen.W[:,:,:-1,:]))+F.average(F.absolute(self.img_gen.W[:,:,:,1:]-self.img_gen.W[:,:,:,:-1]))
+        loss = self.args.lambda_feat * L_feat + self.args.lambda_style * L_style + self.args.lambda_rfeat * L_feat_r + self.args.lambda_tv * L_tv
 
         loss.backward()
         optimizer.update()
 
+        chainer.report({'loss_tv': L_tv}, self.img_gen)
+        chainer.report({'loss_f': L_feat}, self.img_gen)
+        chainer.report({'loss_s': L_style}, self.img_gen)
+        chainer.report({'loss_r': L_feat_r}, self.img_gen)
+
         ## clip to [0,255]-120
-        img_gen.W.data = xp.clip(img_gen.W.data, -120.0, 136.0)
+        self.img_gen.W.data = self.img_gen.xp.clip(self.img_gen.W.data, -120.0, 136.0)
 
-        if i%20==0:
-            print('iter {}/{}... loss: {}, {}, {}, {}'.format(i, args.iter, L_feat.data, L_style.data, L_tv.data, loss.data))
-
-        ## output image
-        if (i % args.interval == 0):
-            med = postprocess(img_gen.W)
+        # visualise
+        if (self.iteration+1) % self.args.vis_freq == 0:
+            med = postprocess(self.img_gen.W, self.args.gpu)
             print("image range {} -- {}".format(np.min(med),np.max(med)))
             med = Image.fromarray(med)
-            if args.median_filter > 0: ## median filter
-                med = med.filter(ImageFilter.MedianFilter(args.median_filter))
-            if args.removebg:  ## paste back background
-               med = Image.alpha_composite(med.convert("RGBA"),bkgnd).convert("RGB")
-            med.save(os.path.join(args.out,'count{:0>4}.jpg'.format(i)))
+            if self.args.median_filter > 0: ## median filter
+                med = med.filter(ImageFilter.MedianFilter(self.args.median_filter))
+#            if args.removebg:  ## paste back background
+            med = Image.alpha_composite(med.convert("RGBA"),self.bkgnd).convert("RGB")
+            med.save(os.path.join(self.args.out,'count{:0>4}.jpg'.format(self.iteration)))
 
 
 #########################
-parser = argparse.ArgumentParser(description='A Neural Algorithm of Artistic Style')
-parser.add_argument('input',  default=None,
-                    help='Original image')
-parser.add_argument('--style', '-s', default=None,
-                    help='Style image')
-parser.add_argument('--out', '-o', default='result',
-                    help='Output directory')
-parser.add_argument('--gpu', '-g', default=0, type=int,
-                    help='GPU ID (negative value indicates CPU)')
-parser.add_argument('--iter', default=5000, type=int,
-                    help='number of iterations')
-parser.add_argument('--interval', default=500, type=int,
-                    help='image output interval')
-parser.add_argument('--lr', default=4.0, type=float,
-                    help='learning rate')
-parser.add_argument('--lambda_tv', default=1e-6, type=float,
-                    help='weight of total variation regularization')
-parser.add_argument('--lambda_feat', default=0.01, type=float,
-                    help='weight for the original shape; increase to retain it')
-parser.add_argument('--lambda_style', default=1.0, type=float,
-                    help='weight for the style')
-parser.add_argument('--median_filter', '-f', default=0, type=int,
-                    help='apply median filter to the output')
-parser.add_argument('--random_start', '-rs', action='store_true',
-                    help="start optimisation using random image, otherwise use the input image as the initial")
-parser.add_argument('--removebg', '-nbg', action='store_true',
-                    help="remove background specified by alpha in png")
+def main():
+    parser = argparse.ArgumentParser(description='A Neural Algorithm of Artistic Style')
+    parser.add_argument('input',  default=None,
+                        help='Original image')
+    parser.add_argument('--style', '-s', default=None,
+                        help='Style image')
+    parser.add_argument('--reduced_image', '-r', default=None,
+                        help='reduced contents image')
+    parser.add_argument('--init_image', '-i', default=None,
+                        help="start optimisation using this image, otherwise start with a random image")
+    parser.add_argument('--out', '-o', default='result',
+                        help='Output directory')
+    parser.add_argument('--gpu', '-g', default=0, type=int,
+                        help='GPU ID (negative value indicates CPU)')
+    parser.add_argument('--iter', default=5000, type=int,
+                        help='number of iterations')
+    parser.add_argument('--vis_freq', '-vf', default=500, type=int,
+                        help='image output interval')
+    parser.add_argument('--ksize', '-k', default=4, type=int,
+                        help='kernel size for reduction')
+    parser.add_argument('--lr', default=4.0, type=float,
+                        help='learning rate')
+    parser.add_argument('--lambda_tv', '-ltv', default=0.1, type=float,
+                        help='weight of total variation regularization')
+    parser.add_argument('--lambda_feat', '-lf', default=0.01, type=float,
+                        help='weight for the original shape; increase to retain it')
+    parser.add_argument('--lambda_rfeat', '-lrf', default=0.01, type=float,
+                        help='weight for the reduce shape; increase to retain it')
+    parser.add_argument('--lambda_style', '-ls', default=1.0, type=float,
+                        help='weight for the style')
+    parser.add_argument('--median_filter', '-f', default=0, type=int,
+                        help='apply median filter to the output')
+    parser.add_argument('--removebg', '-nbg', action='store_true',
+                        help="remove background specified by alpha in png")
+    ## dicom related
+    parser.add_argument('--image_size', default=448, type=int)
+    parser.add_argument('--CT_base', '-ctb', type=int, default=-250)
+    parser.add_argument('--CT_range', '-ctr', type=int, default=500)
+    parser.add_argument('--CT_A_scale', type=float, default=1.0)
+    parser.add_argument('--CT_B_scale', type=float, default=2.148/0.7634)
 
-args = parser.parse_args()
-print(args)
+    args = parser.parse_args()
+    chainer.config.autotune = True
+    chainer.print_runtime_info()
 
-try:
-    os.mkdir(args.out)
-except:
-    pass
+    if not args.style:
+        args.lambda_style = 0
+    if not args.reduced_image:
+        args.lambda_rfeat = 0
 
-if args.gpu >= 0:
-    cuda.get_device(args.gpu).use()
-    xp = cuda.cupy
-else:
-    print("runs desperately slowly without a GPU!")
-    xp = np
+    print(args)
 
-## use pretrained VGG for feature extraction
-nn = VGG()
-serializers.load_npz('vgg16.model', nn)
-if args.gpu>=0:
-    nn.to_gpu()
+    os.makedirs(args.out, exist_ok=True)
+    if args.gpu >= 0:
+        cuda.get_device(args.gpu).use()
+        xp = cuda.cupy
+    else:
+        print("runs desperately slowly without a GPU!")
+        xp = np
 
-## load images
-image = load_image(args.input,removebg=args.removebg)
-style = load_image(args.style,size=(image.shape[3],image.shape[2]), removebg=args.removebg)
-if args.removebg: # background image
-    bg = np.array(Image.open(args.input).convert('RGBA'))
-    bg[:,:,3] = 255-bg[:,:,3]
-    bkgnd = Image.fromarray(bg)
+    ## use pretrained VGG for feature extraction
+    nn = L.VGG16Layers()
 
-print("input image:", image.shape, xp.min(image), xp.max(image))
-print("style image:", style.shape, xp.min(style), xp.max(style))
+    ## load images
+    if os.path.splitext(args.input)[1] == '.dcm':
+        image = load_dicom(args.input, args.CT_base, args.CT_range, args.image_size, args.CT_A_scale)
+        image = xp.tile(image,(1,3,1,1))
+        style = load_dicom(args.style, args.CT_base, args.CT_range, args.image_size, args.CT_B_scale)
+        style = xp.tile(style,(1,3,1,1))
+    else:
+        image = xp.asarray(load_image(args.input,removebg=args.removebg))
+        if args.lambda_style > 0:
+            style = xp.asarray(load_image(args.style,size=(image.shape[3],image.shape[2]), removebg=args.removebg))
+        bg = np.array(Image.open(args.input).convert('RGBA'))
+        bg[:,:,3] = 255-bg[:,:,3]
+        bkgnd = Image.fromarray(bg)
 
-## initial image: original or random
-if args.random_start:
-    generate_image(image, style, args, img_gen=None)
-else:
-    generate_image(image, style, args, img_gen=image)
+    ## initial image: original or random
+    if args.init_image:
+        img_gen = load_image(args.init_image,size=(image.shape[3],image.shape[2]), removebg=args.removebg)
+    else:
+        img_gen = xp.random.uniform(-20,20,image.shape).astype(np.float32)
+
+    print("input image:", image.shape, xp.min(image), xp.max(image))
+
+    ## image to be generated
+    img_gen = L.Parameter(img_gen)
+
+    if args.gpu>=0:
+        nn.to_gpu()
+        img_gen.to_gpu()
+
+    optimizer = optimizers.Adam(alpha=args.lr)
+    optimizer.setup(img_gen)
+
+    ## compute style matrix
+    layers = ["conv1_2","conv2_2","conv3_3","conv4_3"]
+    with chainer.using_config('train', False):
+        feature = nn(Variable(image),layers=layers)
+        if args.lambda_style > 0:
+            feature_s = nn(Variable(style),layers=layers)
+            gram_s = { k:gram_matrix(feature_s[k]) for k in layers}
+        else:
+            gram_s = None
+        if args.lambda_rfeat > 0:
+            reduced_image = xp.asarray(load_image(args.reduced_image,size=(image.shape[3],image.shape[2]),removebg=args.removebg))
+            reduced_feature = nn(F.average_pooling_2d(Variable(reduced_image),args.ksize),layers=layers)
+        else:
+            reduced_feature = None
+
+    # modify loss weights according to the feature vector size
+    args.lambda_rfeat /= args.ksize ** 2
+    # setup updater
+    dummy_iterator = chainer.iterators.SerialIterator(np.array([1]),1)
+    updater = Updater(
+        models=(img_gen,nn),
+        iterator=dummy_iterator,
+        optimizer=optimizer,
+    #    converter=convert.ConcatWithAsyncTransfer(),
+        device=args.gpu,
+        params={'args': args, 'image': image, 'reduced_feature': reduced_feature,
+            'bkgnd': bkgnd, 'feature': feature, 'gram_s': gram_s, 'layers': layers}
+        )
+
+    trainer = training.Trainer(updater, (args.iter, 'iteration'), out=args.out)
+
+    log_interval = (100, 'iteration')
+    log_keys = ['iteration','lr','main/loss_tv','main/loss_f','main/loss_s','main/loss_r']
+    trainer.extend(extensions.observe_lr(), trigger=log_interval)
+    trainer.extend(extensions.LogReport(keys=log_keys, trigger=log_interval))
+    trainer.extend(extensions.PrintReport(log_keys), trigger=log_interval)
+    trainer.extend(extensions.ProgressBar(update_interval=10))
+
+    if extensions.PlotReport.available():
+        trainer.extend(extensions.PlotReport(
+                log_keys[2:], 'iteration',
+                trigger=(1000, 'iteration'), file_name='loss.png'))
+
+    trainer.run()
+
+if __name__ == '__main__':
+    main()
+

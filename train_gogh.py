@@ -24,15 +24,15 @@ from chainer.training import extensions
 ## returns an image in range [0,255]
 def postprocess(var, gpu):
     if gpu >= 0:
-        img = var.array.get() + 120
+        img = var.array.get()
     else:
-        img = var.array+120
-    img = np.clip(img,0,255)
+        img = var.array
     img = img.transpose(0, 2, 3, 1)   
-    if img.shape[3]==1:
-        return np.uint8(img[0,:,:,0])
+    img = np.clip(img[0] + np.array([103.939, 116.779, 123.68]),0,255)
+    if img.shape[2]==1:
+        return np.uint8(img[:,:,0])
     else:
-        return np.uint8(img[0,:,:,::-1])    # BGR => RGB
+        return np.uint8(img[:,:,::-1])    # BGR => RGB
 
 ## gram matrix (style matrix)
 def gram_matrix(y):
@@ -50,22 +50,23 @@ def load_dicom(path,base,rng,h,scale):
     ref_dicom.file_meta.TransferSyntaxUID = dicom.uid.ImplicitVRLittleEndian
     img = ref_dicom.pixel_array.astype(np.float32)+ref_dicom.RescaleIntercept
     if scale != 1.0:
-        img = rescale(img,scale,mode="reflect",preserve_range=True).astype(np.float32)
-    img = (np.clip(img,base,base+rng)-base)/rng * 255 -120
+        img = rescale(img,scale,mode="reflect",preserve_range=True)
+    img = (np.clip(img,base,base+rng)-base)/rng * 255 - np.array([103.939, 116.779, 123.68])
     img = center_crop(img[np.newaxis,:],(h,h))
-    return(img)
+    return(img.astype(np.float32))
 
-## return [0,255]-120 image of shape (3,h,h)
-def load_image(path, size=None, removebg=False):
+## return [0,255] image of shape (3,h,w)
+def load_image(path, size, removebg=False):
     img = Image.open(path)
     if removebg:
         bkgnd = Image.new('RGBA', img.size, 'black')
         img = Image.alpha_composite(bkgnd, img).convert("RGB")
-    if size:
+    if size[0]>0 and size[1]>0:
         img = img.resize(size,Image.LANCZOS)
-#    Image.fromarray(np.uint8(img).transpose((1,2,0))).save("b.jpg")
-    img = np.asarray(img)[:,:,:3].transpose(2, 0, 1)[::-1].astype(np.float32) -120  # BGR
-    return(img[np.newaxis,:])
+    img = np.asarray(img)[:,:,:3]
+    img = img[:,:,::-1]-np.array([103.939, 116.779, 123.68])  # BGR
+    img = img.transpose(2, 0, 1)
+    return(img[np.newaxis,:].astype(np.float32))
 
 class Updater(chainer.training.StandardUpdater):
     def __init__(self, *args, **kwargs):
@@ -78,12 +79,13 @@ class Updater(chainer.training.StandardUpdater):
         self.layers = params['layers']  ## layers used to compute image and style losses
         self.gram_s = params['gram_s']   ## gram matrix of style image
         self.feature = params['feature']   ## feature of contents image
-        self.layer_id = 3 ## which layer output to use for contents comparison; default = 3
+        self.layer_id = 2 ## which layer output to use for contents comparison; default = 2
         super(Updater, self).__init__(*args, **kwargs)
 
     def update_core(self):
         optimizer = self.get_optimizer('main')
         self.img_gen.cleargrads()
+        xp = self.img_gen.xp
         # get mini-batch
 #        batch = self.get_iterator('main').next()
 #        img = self.converter(batch, self.device)
@@ -116,18 +118,20 @@ class Updater(chainer.training.StandardUpdater):
         loss.backward()
         optimizer.update()
 
+        ## log report of losses
         chainer.report({'loss_tv': L_tv}, self.img_gen)
         chainer.report({'loss_f': L_feat}, self.img_gen)
         chainer.report({'loss_s': L_style}, self.img_gen)
         chainer.report({'loss_r': L_feat_r}, self.img_gen)
 
-        ## clip to [0,255]-120
-        self.img_gen.W.data = self.img_gen.xp.clip(self.img_gen.W.data, -120.0, 136.0)
+        ## clip the current image
+        vgg_mean = xp.array([[[103.939]], [[116.779]], [[123.68]]])
+        self.img_gen.W.array[0] = xp.clip(self.img_gen.W.array[0], -vgg_mean, 255-vgg_mean)
 
         # visualise
         if (self.iteration+1) % self.args.vis_freq == 0:
             med = postprocess(self.img_gen.W, self.args.gpu)
-            print("image range {} -- {}".format(np.min(med),np.max(med)))
+#            print("image range {} -- {}".format(np.min(med),np.max(med)))
             med = Image.fromarray(med)
             if self.args.median_filter > 0: ## median filter
                 med = med.filter(ImageFilter.MedianFilter(self.args.median_filter))
@@ -159,18 +163,20 @@ def main():
                         help='kernel size for reduction')
     parser.add_argument('--lr', default=4.0, type=float,
                         help='learning rate')
-    parser.add_argument('--lambda_tv', '-ltv', default=0.1, type=float,
+    parser.add_argument('--lambda_tv', '-ltv', default=1, type=float,
                         help='weight of total variation regularization')
-    parser.add_argument('--lambda_feat', '-lf', default=0.01, type=float,
+    parser.add_argument('--lambda_feat', '-lf', default=0.1, type=float,
                         help='weight for the original shape; increase to retain it')
-    parser.add_argument('--lambda_rfeat', '-lrf', default=0.01, type=float,
+    parser.add_argument('--lambda_rfeat', '-lrf', default=0.1, type=float,
                         help='weight for the reduce shape; increase to retain it')
     parser.add_argument('--lambda_style', '-ls', default=1.0, type=float,
                         help='weight for the style')
-    parser.add_argument('--median_filter', '-f', default=0, type=int,
-                        help='apply median filter to the output')
+    parser.add_argument('--median_filter', '-f', default=3, type=int,
+                        help='kernel size of the median filter applied to the output')
     parser.add_argument('--removebg', '-nbg', action='store_true',
                         help="remove background specified by alpha in png")
+    parser.add_argument('--crop_width', '-cw', type=int, default=0)
+    parser.add_argument('--crop_height', '-ch', type=int, default=0)
     ## dicom related
     parser.add_argument('--image_size', default=448, type=int)
     parser.add_argument('--CT_base', '-ctb', type=int, default=-250)
@@ -207,10 +213,13 @@ def main():
         style = load_dicom(args.style, args.CT_base, args.CT_range, args.image_size, args.CT_B_scale)
         style = xp.tile(style,(1,3,1,1))
     else:
-        image = xp.asarray(load_image(args.input,removebg=args.removebg))
+        image = xp.asarray(load_image(args.input,size=(args.crop_width,args.crop_height),removebg=args.removebg))
         if args.lambda_style > 0:
             style = xp.asarray(load_image(args.style,size=(image.shape[3],image.shape[2]), removebg=args.removebg))
-        bg = np.array(Image.open(args.input).convert('RGBA'))
+        bg = Image.open(args.input).convert('RGBA')
+        if args.crop_height>0 and args.crop_width>0:
+            bg = bg.resize((image.shape[3],image.shape[2]),Image.LANCZOS)
+        bg = np.array(bg)
         bg[:,:,3] = 255-bg[:,:,3]
         bkgnd = Image.fromarray(bg)
 
